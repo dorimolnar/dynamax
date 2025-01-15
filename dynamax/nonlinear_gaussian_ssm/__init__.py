@@ -7,3 +7,4 @@ from dynamax.nonlinear_gaussian_ssm.inference_ekf import extended_kalman_posteri
 from dynamax.nonlinear_gaussian_ssm.inference_ukf import unscented_kalman_filter
 from dynamax.nonlinear_gaussian_ssm.inference_ukf import unscented_kalman_smoother
 from dynamax.nonlinear_gaussian_ssm.inference_ukf import UKFHyperParams
+from dynamax.nonlinear_gaussian_ssm.inference_ekf import extended_kalman_filter_interruption

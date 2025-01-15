@@ -10,6 +10,7 @@ from dynamax.utils.utils import psd_solve, symmetrize
 from dynamax.nonlinear_gaussian_ssm.models import ParamsNLGSSM
 from dynamax.linear_gaussian_ssm.inference import PosteriorGSSMFiltered, PosteriorGSSMSmoothed
 from dynamax.types import PRNGKey
+import equinox as eqx
 
 # Helper functions
 _get_params = lambda x, dim, t: x[t] if x.ndim == dim + 1 else x
@@ -150,12 +151,156 @@ def extended_kalman_filter(
 
     # Run the extended Kalman filter
     carry = (0.0, params.initial_mean, params.initial_covariance)
+    
+    # Change this scan to a simple while-loop and, after evezy iteration you can check the
+    # marginal log likelihood.
+    
     (ll, *_), outputs = lax.scan(_step, carry, jnp.arange(num_timesteps))
+        
+   
     outputs = {"marginal_loglik": ll, **outputs}
     posterior_filtered = PosteriorGSSMFiltered(
         **outputs,
     )
     return posterior_filtered
+
+def extended_kalman_filter_interruption(
+    params: ParamsNLGSSM,
+    emissions: Float[Array, "ntime emission_dim"],
+    num_iter: int = 1,
+    inputs: Optional[Float[Array, "ntime input_dim"]] = None,
+    output_fields: Optional[List[str]]=["filtered_means", "filtered_covariances", "predicted_means", "predicted_covariances"],
+    interruption = None,
+) -> PosteriorGSSMFiltered:
+    r"""Run an (iterated) extended Kalman filter to produce the
+    marginal likelihood and filtered state estimates.
+
+    Args:
+        params: model parameters.
+        emissions: observation sequence.
+        num_iter: number of linearizations around posterior for update step (default 1).
+        inputs: optional array of inputs.
+        output_fields: list of fields to return in posterior object.
+            These can take the values "filtered_means", "filtered_covariances",
+            "predicted_means", "predicted_covariances", and "marginal_loglik".
+
+    Returns:
+        post: posterior object.
+
+    """
+    num_timesteps = len(emissions)
+
+    # Dynamics and emission functions and their Jacobians
+    f, h = params.dynamics_function, params.emission_function
+    F, H = jacfwd(f), jacfwd(h)
+    f, h, F, H = (_process_fn(fn, inputs) for fn in (f, h, F, H))
+    inputs = _process_input(inputs, num_timesteps)
+
+    def _step(carry, t):
+        ll, pred_mean, pred_cov = carry
+
+        # Get parameters and inputs for time index t
+        Q = _get_params(params.dynamics_covariance, 2, t)
+        R = _get_params(params.emission_covariance, 2, t)
+        u = inputs[t]
+        y = emissions[t]
+
+        # Update the log likelihood
+        H_x = H(pred_mean, u)
+        ll += MVN(h(pred_mean, u), H_x @ pred_cov @ H_x.T + R).log_prob(jnp.atleast_1d(y))
+
+        # Condition on this emission
+        filtered_mean, filtered_cov = _condition_on(pred_mean, pred_cov, h, H, R, u, y, num_iter)
+
+        # Predict the next state
+        pred_mean, pred_cov = _predict(filtered_mean, filtered_cov, f, F, Q, u)
+
+        # Build carry and output states
+        carry = (ll, pred_mean, pred_cov)
+        outputs = {
+            "filtered_means": filtered_mean,
+            "filtered_covariances": filtered_cov,
+            "predicted_means": pred_mean,
+            "predicted_covariances": pred_cov,
+            "marginal_loglik": ll,
+        }
+        outputs = {key: val for key, val in outputs.items() if key in output_fields}
+
+        return carry, outputs
+
+    # Run the extended Kalman filter
+    carry = (0.0, params.initial_mean, params.initial_covariance)
+    
+    if(interruption == None):
+        t = jnp.nan
+        (ll, *_), outputs = lax.scan(_step, carry, jnp.arange(num_timesteps))
+    
+    else:
+#        outputs = {key: [] for key in output_fields}
+        t = 0
+
+        step_shapes = {
+            "filtered_means": params.initial_mean.shape,
+            "filtered_covariances": params.initial_covariance.shape,
+            "predicted_means": params.initial_mean.shape,
+            "predicted_covariances": params.initial_covariance.shape,
+        }
+        
+        outputs = {key: jnp.zeros((num_timesteps,) + step_shapes[key]) for key in output_fields}
+#        outputs = {key: jnp.full((num_timesteps,) + step_shapes[key], jnp.nan) for key in output_fields}
+        init_val = (carry, t, outputs)
+        
+        def cond_fun(carry_t):
+            carry, t, _= carry_t
+            return carry[0] > interruption
+
+        def body_fun(carry_t):
+            carry, t, outputs = carry_t
+            carry, step_outputs = _step(carry, t)
+            for key in output_fields:
+               outputs[key] = outputs[key].at[t].set(step_outputs[key])
+#                outputs[key].append(step_outputs[key])
+            return carry, t+1, outputs
+
+        final_carry = eqx.internal.while_loop(
+            cond_fun=cond_fun,
+            body_fun=body_fun,
+            init_val= init_val,
+            max_steps=num_timesteps,
+            kind="bounded",
+        )
+        
+#        while (ll > interruption and t < num_timesteps):
+#            carry, step_outputs = _step(carry, t)
+#            ll = carry[0]
+#            for key in output_fields:
+#                outputs[key].append(step_outputs[key])           
+#            t += 1
+           
+        carry, t, outputs = final_carry 
+        ll = carry[0]
+        
+        # Use lax.dynamic_slice to handle dynamic slicing
+#        outputs = {
+#            key: lax.dynamic_slice(outputs[key], (0, *([0] * (outputs[key].ndim - 1))), (t, *outputs[key].shape[1:])) 
+#            for key in outputs
+#        }
+#        outputs = {key: outputs[key][:t] for key in outputs}       
+#        for key in outputs:
+#            outputs[key] = jnp.stack(outputs[key])
+        
+    
+    outputs = {"marginal_loglik": ll, **outputs}
+    posterior_filtered = PosteriorGSSMFiltered(
+    **outputs,
+    )
+    
+    return posterior_filtered, t
+    
+        
+   
+    
+
 
 
 def iterated_extended_kalman_filter(
